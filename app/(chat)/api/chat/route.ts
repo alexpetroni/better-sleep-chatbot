@@ -305,14 +305,28 @@ export async function POST(request: Request) {
           const streamContext = getStreamContext();
           if (streamContext) {
             const streamId = generateId();
-            await createStreamId({ streamId, chatId: id });
-            await streamContext.createNewResumableStream(
-              streamId,
-              () => sseStream
-            );
+            // Resumable streams are an optional nicety. If Redis is
+            // unreachable/misconfigured, these awaits can hang and stall the
+            // whole response until the function times out — so bound them and
+            // fall back to plain streaming on timeout.
+            await Promise.race([
+              (async () => {
+                await createStreamId({ streamId, chatId: id });
+                await streamContext.createNewResumableStream(
+                  streamId,
+                  () => sseStream
+                );
+              })(),
+              new Promise((_, reject) => {
+                setTimeout(
+                  () => reject(new Error("resumable stream setup timed out")),
+                  2000
+                );
+              }),
+            ]);
           }
         } catch (_) {
-          /* non-critical */
+          /* non-critical: chat still streams without resumability */
         }
       },
     });
