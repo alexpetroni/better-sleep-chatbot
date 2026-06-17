@@ -1,10 +1,3 @@
-import { initBotId } from "botid/client/core";
-
-initBotId({
-  protect: [
-    {
-      path: "/api/chat",
-      method: "POST",
-    },
-  ],
-});
+// Client-side instrumentation hook. BotID was removed (it blocked the chat
+// request in production via its challenge script); nothing to initialize here.
+export {};
