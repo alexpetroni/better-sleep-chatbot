@@ -1,5 +1,45 @@
 export const DEFAULT_CHAT_MODEL = "moonshotai/kimi-k2.5";
 
+// Role-based model routing for the two-phase intake pipeline, on Fireworks.ai.
+// The interviewer and the silent extractor run on a cheap fast model; the final
+// assessment runs on a stronger model. All overridable via env so the exact
+// Fireworks model ids (accounts/fireworks/models/<name>) and the cost/quality
+// trade-off can be tuned without a code change.
+export const interviewModelId =
+  process.env.INTERVIEW_MODEL ?? "accounts/fireworks/models/deepseek-v4-flash";
+export const extractorModelId =
+  process.env.EXTRACTOR_MODEL ?? "accounts/fireworks/models/deepseek-v4-flash";
+// glm-5p2 reliably streams user-visible text. The DeepSeek/Kimi "thinking"
+// models (deepseek-v4-pro, kimi-k2p5) write cleaner/cheaper Romanian but
+// sometimes emit ONLY a reasoning channel and no final text — which the chat UI
+// hides (sendReasoning:false), leaving a blank answer. So glm-5p2 is the safe
+// default for the user-facing conclusion; override ASSESSOR_MODEL to experiment.
+export const assessorModelId =
+  process.env.ASSESSOR_MODEL ?? "accounts/fireworks/models/glm-5p2";
+// Cheap model for chat-title generation.
+export const titleModelId =
+  process.env.TITLE_MODEL ?? "accounts/fireworks/models/deepseek-v4-flash";
+
+// The Fireworks serverless models we use are "thinking" models: by default they
+// burn the output-token budget on an inline reasoning scratchpad and often never
+// emit the final answer (blank reply, since the UI hides reasoning). Controlling
+// reasoning effort fixes this — "none" guarantees a direct answer; a higher
+// effort can improve quality IF the output cap leaves room for reasoning + text.
+// (camelCase key; the AI SDK forwards it to Fireworks as reasoning_effort.)
+export type ReasoningEffort = "none" | "low" | "medium" | "high";
+export function fireworksReasoning(effort: ReasoningEffort) {
+  return { fireworks: { reasoningEffort: effort } } as const;
+}
+// Interviewer + extractor stay direct (fast, cheap, never blank).
+export const fireworksReasoningOff = fireworksReasoning("none");
+// Assessor is tunable: more room + some reasoning tends to give a fuller, better
+// structured conclusion. Both overridable via env.
+export const assessorReasoningEffort = (process.env.ASSESSOR_REASONING_EFFORT ??
+  "none") as ReasoningEffort;
+export const assessorMaxTokens = Number(
+  process.env.ASSESSOR_MAX_TOKENS ?? 3000
+);
+
 export const titleModel = {
   id: "moonshotai/kimi-k2.5",
   name: "Kimi K2.5",

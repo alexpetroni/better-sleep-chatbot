@@ -1,6 +1,13 @@
-import { customProvider, gateway } from "ai";
+import { createFireworks } from "@ai-sdk/fireworks";
+import { customProvider } from "ai";
 import { isTestEnvironment } from "../constants";
-import { titleModel } from "./models";
+import { titleModelId } from "./models";
+
+// Inference runs on Fireworks.ai (the Vercel AI Gateway free tier rate-limited
+// every model account-wide). The API key is read from FIREWORKS_API_KEY.
+const fireworks = createFireworks({
+  apiKey: process.env.FIREWORKS_API_KEY ?? "",
+});
 
 export const myProvider = isTestEnvironment
   ? (() => {
@@ -19,12 +26,12 @@ export function getLanguageModel(modelId: string) {
     return myProvider.languageModel(modelId);
   }
 
-  return gateway.languageModel(modelId);
+  return fireworks(modelId);
 }
 
 export function getTitleModel() {
   if (isTestEnvironment && myProvider) {
     return myProvider.languageModel("title-model");
   }
-  return gateway.languageModel(titleModel.id);
+  return fireworks(titleModelId);
 }

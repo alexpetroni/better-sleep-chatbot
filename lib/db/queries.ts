@@ -23,6 +23,7 @@ import {
   chat,
   type DBMessage,
   document,
+  intakeState,
   message,
   type Suggestion,
   stream,
@@ -610,6 +611,47 @@ export async function createStreamId({
       "bad_request:database",
       "Failed to create stream id"
     );
+  }
+}
+
+export async function getIntakeStateByChatId({
+  chatId,
+}: {
+  chatId: string;
+}): Promise<unknown | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(intakeState)
+      .where(eq(intakeState.chatId, chatId))
+      .limit(1);
+    return row?.state ?? null;
+  } catch (_error) {
+    // Intake state is best-effort: if the table/connection misbehaves we let
+    // the conversation continue from a fresh checklist rather than 500.
+    return null;
+  }
+}
+
+export async function upsertIntakeState({
+  chatId,
+  state,
+  phase,
+}: {
+  chatId: string;
+  state: unknown;
+  phase: string;
+}) {
+  try {
+    await db
+      .insert(intakeState)
+      .values({ chatId, state, phase, updatedAt: new Date() })
+      .onConflictDoUpdate({
+        target: intakeState.chatId,
+        set: { state, phase, updatedAt: new Date() },
+      });
+  } catch (_error) {
+    // Non-fatal: persistence failure should not break the live response.
   }
 }
 

@@ -134,3 +134,18 @@ export const stream = pgTable(
 );
 
 export type Stream = InferSelectModel<typeof stream>;
+
+// Per-conversation intake checklist state for the sleep-coach agent.
+// One row per chat; `state` holds the whole IntakeStateData JSON document
+// (subjects, profile, per-model token usage). See lib/intake/state.ts.
+export const intakeState = pgTable("IntakeState", {
+  chatId: uuid("chatId")
+    .primaryKey()
+    .notNull()
+    .references(() => chat.id),
+  state: json("state").notNull(),
+  phase: varchar("phase").notNull().default("intake"),
+  updatedAt: timestamp("updatedAt").notNull().defaultNow(),
+});
+
+export type IntakeStateRow = InferSelectModel<typeof intakeState>;

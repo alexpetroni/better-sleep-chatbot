@@ -12,29 +12,44 @@ import { createResumableStreamContext } from "resumable-stream";
 import { auth, type UserType } from "@/app/(auth)/auth";
 import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import {
-  allowedModelIds,
-  chatModels,
-  DEFAULT_CHAT_MODEL,
-  getCapabilities,
+  assessorMaxTokens,
+  assessorModelId,
+  assessorReasoningEffort,
+  extractorModelId,
+  fireworksReasoning,
+  fireworksReasoningOff,
+  interviewModelId,
 } from "@/lib/ai/models";
-import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
+import {
+  assessorSystemPrompt,
+  interviewerSystemPrompt,
+  type RequestHints,
+} from "@/lib/ai/prompts";
 import { getLanguageModel } from "@/lib/ai/providers";
-import { createDocument } from "@/lib/ai/tools/create-document";
-import { editDocument } from "@/lib/ai/tools/edit-document";
-import { getWeather } from "@/lib/ai/tools/get-weather";
-import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
-import { updateDocument } from "@/lib/ai/tools/update-document";
+import { logQuestionnaireCost } from "@/lib/intake/cost";
+import { runExtractor } from "@/lib/intake/extractor";
+import {
+  accumulateUsage,
+  applyExtractor,
+  coerceIntakeState,
+  isIntakeComplete,
+  pickNextTarget,
+  seedIntakeState,
+  userRequestedConclusion,
+} from "@/lib/intake/state";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
   deleteChatById,
   getChatById,
+  getIntakeStateByChatId,
   getMessageCountByUserId,
   getMessagesByChatId,
   saveChat,
   saveMessages,
   updateChatTitleById,
   updateMessage,
+  upsertIntakeState,
 } from "@/lib/db/queries";
 import type { DBMessage } from "@/lib/db/schema";
 import { ChatbotError } from "@/lib/errors";
@@ -67,18 +82,13 @@ export async function POST(request: Request) {
   }
 
   try {
-    const { id, message, messages, selectedChatModel, selectedVisibilityType } =
-      requestBody;
+    const { id, message, messages, selectedVisibilityType } = requestBody;
 
     const session = await auth();
 
     if (!session?.user) {
       return new ChatbotError("unauthorized:chat").toResponse();
     }
-
-    const chatModel = allowedModelIds.has(selectedChatModel)
-      ? selectedChatModel
-      : DEFAULT_CHAT_MODEL;
 
     await checkIpRateLimit(ipAddress(request));
 
@@ -176,63 +186,84 @@ export async function POST(request: Request) {
       });
     }
 
-    const modelConfig = chatModels.find((m) => m.id === chatModel);
-    const modelCapabilities = await getCapabilities();
-    const capabilities = modelCapabilities[chatModel];
-    const isReasoningModel = capabilities?.reasoning === true;
-
     const modelMessages = await convertToModelMessages(uiMessages);
+
+    // Load or seed the per-conversation intake checklist (26 cause categories).
+    const rawIntake = await getIntakeStateByChatId({ chatId: id });
+    const intake = rawIntake ? coerceIntakeState(rawIntake) : seedIntakeState();
 
     const stream = createUIMessageStream({
       originalMessages: isToolApprovalFlow ? uiMessages : undefined,
       execute: async ({ writer: dataStream }) => {
-        const result = streamText({
-          model: getLanguageModel(chatModel),
-          system: systemPrompt({ requestHints }),
-          messages: modelMessages,
-          // This agent runs as a conversational intake interview, not a
-          // tool-calling loop: it asks adaptive questions across multiple
-          // turns and then delivers a long-form analysis in prose. No tools
-          // are active, so a single generation per turn is enough; the step
-          // budget is kept generous purely as a safety margin.
-          stopWhen: stepCountIs(10),
-          experimental_activeTools: [],
-          providerOptions: {
-            ...(modelConfig?.gatewayOrder && {
-              gateway: { order: modelConfig.gatewayOrder },
-            }),
-            ...(modelConfig?.reasoningEffort && {
-              openai: { reasoningEffort: modelConfig.reasoningEffort },
-            }),
-          },
-          tools: {
-            getWeather,
-            createDocument: createDocument({
-              session,
-              dataStream,
-              modelId: chatModel,
-            }),
-            editDocument: editDocument({ dataStream, session }),
-            updateDocument: updateDocument({
-              session,
-              dataStream,
-              modelId: chatModel,
-            }),
-            requestSuggestions: requestSuggestions({
-              session,
-              dataStream,
-              modelId: chatModel,
-            }),
-          },
-          experimental_telemetry: {
-            isEnabled: isProductionEnvironment,
-            functionId: "stream-text",
-          },
-        });
+        // 1. Silent extraction pass (cheap model): map this turn onto the
+        //    checklist, update the profile, and apply retry/exhaustion logic.
+        const {
+          result: extracted,
+          usage: extractUsage,
+          ok: extractOk,
+        } = await runExtractor(modelMessages);
+        accumulateUsage(intake, extractorModelId, extractUsage);
+        applyExtractor(intake, extracted, { penalizeTarget: extractOk });
 
-        dataStream.merge(
-          result.toUIMessageStream({ sendReasoning: isReasoningModel })
-        );
+        // 2. Decide: keep interviewing, or hand off to the assessor. Handoff
+        //    happens when every applicable subject is settled (red flags probed),
+        //    or the user explicitly asks for the verdict now.
+        const lastUserText =
+          (Array.isArray(message?.parts) ? message.parts : [])
+            .filter(
+              (p): p is { type: "text"; text: string } =>
+                (p as { type?: string }).type === "text"
+            )
+            .map((p) => p.text)
+            .join(" ") || "";
+        const nextTarget = pickNextTarget(intake);
+        const handoff =
+          extracted.userWantsConclusion ||
+          userRequestedConclusion(lastUserText) ||
+          nextTarget === null ||
+          isIntakeComplete(intake);
+
+        let activeModelId: string;
+        if (handoff) {
+          intake.phase = "assessed";
+          activeModelId = assessorModelId;
+        } else {
+          intake.phase = "intake";
+          intake.targetId = nextTarget;
+          activeModelId = interviewModelId;
+        }
+
+        const result = handoff
+          ? streamText({
+              model: getLanguageModel(assessorModelId),
+              system: assessorSystemPrompt({ requestHints, state: intake }),
+              messages: modelMessages,
+              maxOutputTokens: assessorMaxTokens,
+              providerOptions: fireworksReasoning(assessorReasoningEffort),
+              stopWhen: stepCountIs(2),
+              experimental_telemetry: {
+                isEnabled: isProductionEnvironment,
+                functionId: "assess",
+              },
+            })
+          : streamText({
+              model: getLanguageModel(interviewModelId),
+              system: interviewerSystemPrompt({
+                requestHints,
+                state: intake,
+                targetId: nextTarget,
+              }),
+              messages: modelMessages,
+              maxOutputTokens: 800,
+              providerOptions: fireworksReasoningOff,
+              stopWhen: stepCountIs(2),
+              experimental_telemetry: {
+                isEnabled: isProductionEnvironment,
+                functionId: "interview",
+              },
+            });
+
+        dataStream.merge(result.toUIMessageStream({ sendReasoning: false }));
 
         if (titlePromise) {
           try {
@@ -243,6 +274,32 @@ export async function POST(request: Request) {
             /* non-fatal */
           }
         }
+
+        // 3. After generation: record token usage, persist checklist state,
+        //    and (when SHOW_COST=true) log the per-model cost breakdown.
+        try {
+          const finalUsage = await result.usage;
+          accumulateUsage(intake, activeModelId, {
+            inputTokens: finalUsage?.inputTokens,
+            outputTokens: finalUsage?.outputTokens,
+          });
+        } catch (_) {
+          /* usage not critical */
+        }
+        await upsertIntakeState({
+          chatId: id,
+          state: intake,
+          phase: intake.phase,
+        });
+        await logQuestionnaireCost(
+          intake,
+          {
+            interview: interviewModelId,
+            extractor: extractorModelId,
+            assessor: assessorModelId,
+          },
+          { final: intake.phase === "assessed" }
+        );
       },
       generateId: generateUUID,
       onFinish: async ({ messages: finishedMessages }) => {
